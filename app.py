@@ -10,7 +10,7 @@ app = Flask(__name__)
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "google/gemini-2.0-flash-001")  # Changed to Gemini
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "poolside/laguna-xs.2:free")  # Changed to Gemini
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 SITE_URL = os.environ.get("SITE_URL", "https://vectron.onrender.com")
 
