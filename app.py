@@ -15,7 +15,8 @@ app = Flask(__name__)
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-DEFAULT_MODEL = "poolside/laguna-xs.2:free"
+DEFAULT_MODEL = "laguna-llama-3.2-3b-instruct:free"
+IMAGE_MODEL = "black-forest-labs/flux-schnell-free"  # Free image model
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 SITE_URL = os.environ.get("SITE_URL", "https://vectron.onrender.com")
 
@@ -31,7 +32,7 @@ SUBSCRIPTION_PLANS = {
         "price_id": "free",
         "max_tokens_per_day": 10000,
         "max_messages_per_day": 50,
-        "features": ["Basic AI Chat", "Code Generation", "Calculator Tool", "System Info"],
+        "features": ["Basic AI Chat", "Code Generation", "Calculator Tool", "System Info", "Image Generation (5/day)"],
         "models": ["laguna-llama-3.2-3b-instruct:free"]
     },
     "pro": {
@@ -40,7 +41,7 @@ SUBSCRIPTION_PLANS = {
         "price_id": "pro_monthly",
         "max_tokens_per_day": 100000,
         "max_messages_per_day": 500,
-        "features": ["Everything in Free", "Priority Response", "Longer Context (128k)", "Advanced Models", "Image Generation", "No Ads"],
+        "features": ["Everything in Free", "Priority Response", "Longer Context (128k)", "Advanced Models", "More Images (50/day)", "No Ads"],
         "models": ["laguna-llama-3.2-3b-instruct:free"]
     },
     "enterprise": {
@@ -74,6 +75,9 @@ VERIFIED_PAYMENTS = {}
 USERS = {}
 SUBSCRIPTIONS = {}
 
+# Track image generation counts per user
+IMAGE_GENERATION_COUNTS = {}
+
 # Exchange rates (approximate - in production, use a real API)
 EXCHANGE_RATES = {
     "BWP": 13.5,  # 1 USD ≈ 13.5 BWP
@@ -91,6 +95,7 @@ SYSTEM_PROMPT = """You are Vectron, a powerful AI agent. You can:
 - Help with coding, writing, analysis, and research
 - Remember the conversation history within this session
 - Generate clean, working code when asked
+- Generate images when asked (use the image generation tool)
 
 When writing code, always wrap it in triple backtick fences with the language name.
 Be direct, smart, and actually useful."""
@@ -125,9 +130,14 @@ def check_rate_limit():
     if "usage" not in session:
         session["usage"] = {}
     if today not in session["usage"]:
-        session["usage"][today] = {"messages": 0, "tokens": 0}
+        session["usage"][today] = {"messages": 0, "tokens": 0, "images": 0}
     
     usage = session["usage"][today]
+    
+    # Check image limits for free tier (5 per day)
+    image_limit = 5 if plan == "free" else 50 if plan == "pro" else 500
+    if usage.get("images", 0) >= image_limit:
+        return False, f"You've reached your daily image generation limit ({image_limit} images). Please upgrade to Pro for just $12/month!"
     
     if usage["messages"] >= limits["max_messages_per_day"]:
         return False, f"You've reached your daily message limit ({limits['max_messages_per_day']} messages). Please upgrade to Pro for just $12/month!"
@@ -136,16 +146,17 @@ def check_rate_limit():
     
     return True, None
 
-def update_usage(messages_count=1, tokens_used=0):
+def update_usage(messages_count=1, tokens_used=0, images_count=0):
     """Update user's usage statistics"""
     today = datetime.now().date().isoformat()
     if "usage" not in session:
         session["usage"] = {}
     if today not in session["usage"]:
-        session["usage"][today] = {"messages": 0, "tokens": 0}
+        session["usage"][today] = {"messages": 0, "tokens": 0, "images": 0}
     
     session["usage"][today]["messages"] += messages_count
     session["usage"][today]["tokens"] += tokens_used
+    session["usage"][today]["images"] += images_count
 
 def require_subscription(required_plan):
     """Decorator to check if user has required subscription"""
@@ -190,6 +201,36 @@ def call_openrouter(messages, temperature=0.7, max_tokens=2048, model=None):
     resp.raise_for_status()
     data = resp.json()
     return data["choices"][0]["message"]["content"], data.get("usage", {})
+
+def generate_image(prompt):
+    """Generate an image from text prompt using OpenRouter"""
+    if not OPENROUTER_API_KEY:
+        raise ValueError("OPENROUTER_API_KEY not set")
+    
+    payload = {
+        "model": IMAGE_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "modalities": ["image"]
+    }
+    
+    resp = requests.post(BASE_URL, headers=openrouter_headers(), json=payload, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    
+    # Extract image URL from response
+    content = data["choices"][0]["message"]["content"]
+    
+    # If content is a URL, return it directly
+    if content.startswith("http"):
+        return content
+    
+    # Try to extract markdown image URL
+    import re
+    url_match = re.search(r'!\[.*?\]\((.*?)\)', content)
+    if url_match:
+        return url_match.group(1)
+    
+    return content
 
 def calculate(expression):
     try:
@@ -246,7 +287,7 @@ def get_plans():
     """Get available subscription plans"""
     user_plan = get_user_plan()
     today = datetime.now().date().isoformat()
-    usage = session.get("usage", {}).get(today, {"messages": 0, "tokens": 0})
+    usage = session.get("usage", {}).get(today, {"messages": 0, "tokens": 0, "images": 0})
     return jsonify({
         "plans": SUBSCRIPTION_PLANS,
         "current_plan": user_plan,
@@ -464,6 +505,40 @@ def chat():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/generate-image", methods=["POST"])
+def generate_image_route():
+    """Generate an image from text prompt"""
+    data = request.json or {}
+    prompt = data.get("prompt", "").strip()
+    
+    if not prompt:
+        return jsonify({"error": "No prompt provided"}), 400
+    
+    # Check rate limits
+    allowed, error_msg = check_rate_limit()
+    if not allowed:
+        return jsonify({"error": error_msg}), 429
+    
+    try:
+        image_url = generate_image(prompt)
+        update_usage(images_count=1)
+        
+        # Get remaining image count
+        today = datetime.now().date().isoformat()
+        usage = session.get("usage", {}).get(today, {"images": 0})
+        plan = get_user_plan()
+        image_limit = 5 if plan == "free" else 50 if plan == "pro" else 500
+        remaining_images = image_limit - usage.get("images", 0)
+        
+        return jsonify({
+            "success": True,
+            "image_url": image_url,
+            "prompt": prompt,
+            "remaining_images": remaining_images
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/tool", methods=["POST"])
 def tool():
     data = request.json or {}
@@ -499,6 +574,20 @@ def tool():
             return jsonify({"result": reply})
         except Exception as e:
             return jsonify({"result": f"Error: {e}"}), 500
+    
+    elif tool_name == "image":
+        if not args:
+            return jsonify({"result": "Describe the image you want"}), 400
+        try:
+            image_url = generate_image(args)
+            update_usage(images_count=1)
+            return jsonify({
+                "result": f"![Generated Image]({image_url})",
+                "image_url": image_url,
+                "type": "image"
+            })
+        except Exception as e:
+            return jsonify({"result": f"Error generating image: {e}"}), 500
 
     return jsonify({"error": f"Unknown tool '{tool_name}'"}), 400
 
@@ -672,6 +761,18 @@ header{
 .msg.user .bubble-inner{
   background:var(--user-bg);border:1px solid var(--border);
   color:var(--text);border-radius:var(--radius) var(--radius) 4px var(--radius);
+}
+
+/* Image styling */
+.generated-image {
+  max-width: 100%;
+  border-radius: var(--radius);
+  margin: 10px 0;
+  border: 1px solid var(--border);
+}
+.image-container {
+  text-align: center;
+  margin: 10px 0;
 }
 
 /* markdown */
@@ -917,6 +1018,7 @@ header{
       <button class="sheet-tool-btn" onclick="sheetTool('code')">⌨ Code</button>
       <button class="sheet-tool-btn" onclick="sheetTool('calculate')">∑ Calculator</button>
       <button class="sheet-tool-btn" onclick="sheetTool('system_info')">⚙ System Info</button>
+      <button class="sheet-tool-btn" onclick="sheetTool('image')">🎨 Generate Image</button>
     </div>
   </div>
   <div id="sheet-model-section">
@@ -959,6 +1061,7 @@ header{
     <button class="tool-btn" onclick="openTool('code')"><div class="tool-icon">⌨</div> Generate Code</button>
     <button class="tool-btn" onclick="openTool('calculate')"><div class="tool-icon">∑</div> Calculator</button>
     <button class="tool-btn" onclick="openTool('system_info')"><div class="tool-icon">⚙</div> System Info</button>
+    <button class="tool-btn" onclick="openTool('image')"><div class="tool-icon">🎨</div> Generate Image</button>
     <div class="sidebar-divider"></div>
     <div class="sidebar-label">Session</div>
     <button class="tool-btn" onclick="resetChat()"><div class="tool-icon">↺</div> New Chat</button>
@@ -970,12 +1073,12 @@ header{
       <div class="empty-state" id="empty-state">
         <div class="empty-icon">⚡</div>
         <h2>What can I help with?</h2>
-        <p>Ask anything, generate code, or use the tools.</p>
+        <p>Ask anything, generate code, create images, or use the tools.</p>
         <div class="suggestion-chips">
           <div class="chip" onclick="sendSuggestion('Write a Python Flask REST API with JWT auth')">Flask REST API</div>
           <div class="chip" onclick="sendSuggestion('Explain async/await in Python')">Async/Await</div>
           <div class="chip" onclick="sendSuggestion('Write a web scraper with requests and BeautifulSoup')">Web scraper</div>
-          <div class="chip" onclick="sendSuggestion('How do I deploy a Flask app on Render?')">Deploy on Render</div>
+          <div class="chip" onclick="sendSuggestion('Generate an image of a futuristic city')">🎨 Futuristic City</div>
         </div>
       </div>
     </div>
@@ -1059,10 +1162,8 @@ let currentPaymentId = null;
 let paymentStep = "select"; // select, payment, receipt
 
 // ── FIXED COPY FUNCTION ───────────────────────────────────────────────────────────
-// Improved copy function that properly handles code content
 window.copyCode = function(btn, codeBase64) {
   try {
-    // Decode the base64 encoded code
     const code = atob(codeBase64);
     
     navigator.clipboard.writeText(code).then(() => {
@@ -1075,7 +1176,6 @@ window.copyCode = function(btn, codeBase64) {
       }, 2000);
     }).catch(err => {
       console.error('Clipboard write failed:', err);
-      // Fallback: show the code in a prompt
       prompt('Copy manually (Ctrl+C):', code);
     });
   } catch(e) {
@@ -1098,20 +1198,15 @@ function renderMarkdown(text){
     const code = pre.querySelector('code');
     if(!code) return;
     
-    // Get the language from the code class
     let lang = 'text';
     if (code.className) {
       const match = code.className.match(/language-(\w+)/);
       if (match) lang = match[1];
     }
     
-    // Get the raw code content - preserve it exactly as is
     const rawCode = code.textContent;
-    
-    // Convert to base64 to avoid escaping issues
     const base64Code = btoa(unescape(encodeURIComponent(rawCode)));
     
-    // Create the enhanced code block with proper copy button
     const block = document.createElement('div');
     block.className = 'code-block';
     
@@ -1137,7 +1232,6 @@ function renderMarkdown(text){
     pre.replaceWith(block);
   });
   
-  // Highlight all code blocks
   w.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
   return w.innerHTML;
 }
@@ -1164,12 +1258,26 @@ function appendAgentMsg(text){
   scrollBottom();
 }
 
-function appendToolResult(name,result,saved){
+function appendToolResult(name, result, saved, type) {
   hideEmpty();
-  const savedHtml=saved?`<div style="margin-top:8px;font-size:11px;color:var(--text-muted);font-family:'JetBrains Mono',monospace">💾 ${saved}</div>`:'';
-  const d=document.createElement('div');
-  d.className='tool-result';
-  d.innerHTML=`<div class="tool-result-header">⚙ ${name}</div><div>${renderMarkdown(result)}</div>${savedHtml}`;
+  const savedHtml = saved ? `<div style="margin-top:8px;font-size:11px;color:var(--text-muted);font-family:'JetBrains Mono',monospace">💾 ${saved}</div>` : '';
+  
+  let contentHtml = '';
+  if (type === 'image' && result.image_url) {
+    contentHtml = `<div class="image-container"><img src="${result.image_url}" alt="Generated Image" class="generated-image" onerror="this.src='https://placehold.co/512x512?text=Image+Failed+to+Load'"></div>`;
+    if (result.prompt) {
+      contentHtml += `<div style="margin-top:8px;font-size:12px;color:var(--text-muted);">Prompt: ${escapeHtml(result.prompt)}</div>`;
+    }
+    if (result.remaining_images !== undefined) {
+      contentHtml += `<div style="margin-top:8px;font-size:11px;color:var(--orange);">🎨 ${result.remaining_images} images remaining today</div>`;
+    }
+  } else {
+    contentHtml = renderMarkdown(result);
+  }
+  
+  const d = document.createElement('div');
+  d.className = 'tool-result';
+  d.innerHTML = `<div class="tool-result-header">⚙ ${name}</div>${contentHtml}${savedHtml}`;
   document.getElementById('messages').appendChild(d);
   scrollBottom();
 }
@@ -1223,6 +1331,7 @@ const toolConfig={
   code:{title:'Generate Code',desc:'Describe what you want and AI will generate it.',placeholder:'e.g. Flask REST API with JWT auth'},
   calculate:{title:'Calculator',desc:'Evaluate a math expression.',placeholder:'e.g. (100 * 1.15) + 50'},
   system_info:{title:'System Info',desc:'Show current system info.',placeholder:''},
+  image:{title:'Generate Image',desc:'Describe the image you want to create.',placeholder:'e.g. A beautiful sunset over mountains with a lake, digital art style'}
 };
 
 function openTool(name){
@@ -1242,20 +1351,67 @@ async function runTool(){
   const args=document.getElementById('modal-input').value.trim();
   const tool=currentTool;
   closeModal();setLoading(true);
+  
+  if(tool === 'image') {
+    if(!args) {
+      appendToolResult('Generate Image', 'Please describe the image you want to create.', null, 'text');
+      setLoading(false);
+      return;
+    }
+    
+    showThinking();
+    try {
+      const res = await fetch('/generate-image', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({prompt: args})
+      });
+      const data = await res.json();
+      removeThinking();
+      
+      if(data.error) {
+        if(res.status === 429) {
+          appendToolResult('Rate Limit', data.error, null, 'text');
+          openUpgradeModal();
+        } else {
+          appendToolResult('Error', data.error, null, 'text');
+        }
+      } else {
+        appendToolResult('Generated Image', {
+          image_url: data.image_url,
+          prompt: data.prompt,
+          remaining_images: data.remaining_images
+        }, null, 'image');
+        
+        // Update remaining badge
+        if(data.remaining_images !== undefined) {
+          document.getElementById('remaining-badge').textContent = `✨ ${data.remaining_images} images remaining today`;
+        }
+      }
+    } catch(e) {
+      removeThinking();
+      appendToolResult('Error', e.message, null, 'text');
+    }
+    finally {
+      setLoading(false);
+    }
+    return;
+  }
+  
   try{
     const res=await fetch('/tool',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tool:tool||'system_info',args})});
     const data=await res.json();
     if(data.error){
       if(res.status === 429){
-        appendToolResult('Rate Limit', data.error);
+        appendToolResult('Rate Limit', data.error, null, 'text');
         openUpgradeModal();
       } else {
-        appendToolResult('Error', data.error);
+        appendToolResult('Error', data.error, null, 'text');
       }
     } else {
-      appendToolResult(toolConfig[tool]?.title||tool,data.result,data.saved);
+      appendToolResult(toolConfig[tool]?.title||tool, data.result, data.saved, data.type || 'text');
     }
-  }catch(e){appendToolResult('Error',e.message);}
+  }catch(e){appendToolResult('Error',e.message, null, 'text');}
   finally{setLoading(false);}
 }
 document.getElementById('modal').addEventListener('click',function(e){if(e.target===this)closeModal();});
@@ -1322,8 +1478,9 @@ async function loadPlans() {
     const today = new Date().toISOString().split('T')[0];
     if(data.usage) {
       const limits = data.plans[currentUserPlan];
-      const remaining = limits.max_messages_per_day - (data.usage.messages || 0);
-      document.getElementById('remaining-badge').textContent = `✨ ${remaining} messages remaining today`;
+      const remainingMessages = limits.max_messages_per_day - (data.usage.messages || 0);
+      const remainingImages = (currentUserPlan === 'free' ? 5 : currentUserPlan === 'pro' ? 50 : 500) - (data.usage.images || 0);
+      document.getElementById('remaining-badge').textContent = `💬 ${remainingMessages} msgs · 🎨 ${remainingImages} images left today`;
     }
   } catch(e) { console.error('Failed to load plans:', e); }
 }
@@ -1376,7 +1533,6 @@ async function processUpgrade() {
   const btn = document.getElementById('subscribe-btn');
   
   if(paymentStep === "select") {
-    // First step: show payment form
     document.getElementById('payment-form').style.display = 'block';
     document.getElementById('subscribe-btn').textContent = 'Continue to Payment';
     document.getElementById('subscribe-btn').classList.remove('btn-upgrade');
@@ -1386,7 +1542,6 @@ async function processUpgrade() {
   }
   
   if(paymentStep === "payment") {
-    // Submit payment initiation
     const countryCode = document.getElementById('payment-country').value;
     const phoneNumber = document.getElementById('payment-phone').value.trim();
     
@@ -1423,7 +1578,6 @@ async function processUpgrade() {
         btn.disabled = false;
         btn.textContent = 'Upload Receipt & Activate';
         
-        // Add file preview
         const fileInput = document.getElementById('receipt-file');
         fileInput.onchange = function(e) {
           const preview = document.getElementById('receipt-preview');
@@ -1447,7 +1601,6 @@ async function processUpgrade() {
   }
   
   if(paymentStep === "receipt") {
-    // Upload receipt
     const receiptFile = document.getElementById('receipt-file').files[0];
     
     if(!receiptFile) {
@@ -1534,15 +1687,16 @@ async function resetChat(){
     <div class="empty-state" id="empty-state">
       <div class="empty-icon">⚡</div>
       <h2>What can I help with?</h2>
-      <p>Ask anything, generate code, or use the tools.</p>
+      <p>Ask anything, generate code, create images, or use the tools.</p>
       <div class="suggestion-chips">
         <div class="chip" onclick="sendSuggestion('Write a Python Flask REST API with JWT auth')">Flask REST API</div>
         <div class="chip" onclick="sendSuggestion('Explain async/await in Python')">Async/Await</div>
         <div class="chip" onclick="sendSuggestion('Write a web scraper with requests and BeautifulSoup')">Web scraper</div>
-        <div class="chip" onclick="sendSuggestion('How do I deploy a Flask app on Render?')">Deploy on Render</div>
+        <div class="chip" onclick="sendSuggestion('Generate an image of a futuristic city')">🎨 Futuristic City</div>
       </div>
     </div>`;
   document.getElementById('token-count').textContent='0 tokens';
+  loadPlans(); // Refresh usage display
 }
 
 // ── INIT ─────────────────────────────────────────────────────────────────────
